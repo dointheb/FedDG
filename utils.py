@@ -28,7 +28,7 @@ def get_params(args):
         path = '/newdata3/nzw/Datasets/PACS/images'
         num_clients = 3
         train_split = 0.8
-        domains = ['photo', 'art', 'cartoon', 'sketch']
+        domains = ['photo', 'art_painting', 'cartoon', 'sketch']
         num_classes = 7
         batch_size = 16
         lr = 0.001

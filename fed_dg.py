@@ -19,12 +19,13 @@ class fed_dg:
         self.root , self.num_clients, self.train_split, self.domains, self.num_classes, self.batch_size, self.lr, self.hyper = utils.get_params(args)
         self.train_loaders, self.valid_loaders, self.test_loader = self.get_data(self.root,self.domains,self.test_domain,self.train_split)
         
-        self.global_feature_extractor = models.resnet18(pretrained=True)
+        self.global_feature_extractor = models.resnet18(pretrained=True).to(self.device)
+        self.global_feature_extractor.fc = nn.Linear(512, 512).to(self.device)
         self.global_classifer = nn.Sequential(
             nn.Linear(512,128),
             nn.ReLU(),
             nn.Linear(128, self.num_classes)
-        )
+        ).to(self.device)
 
         
 
@@ -82,6 +83,9 @@ class fed_dg:
         scheduler = CosineAnnealingLR(optimizer, T_max=self.args.n_epochs, eta_min=0.0001)
         rand_augment = RandAugment(num_ops=2, magnitude=9)
         sum_loss = 0
+        sum_acc = 0
+        features = []
+        labels = []
         for epoch in range(self.args.n_client_epochs):
             train_loss = 0
             train_correct = 0
@@ -96,8 +100,11 @@ class fed_dg:
                 aug_data = self.apply_randaugment(data,rand_augment).to(self.device)
 
                 optimizer.zero_grad()
+                feature = local_feature_extractor(data)
+                features.append(feature)
+                labels.append(torch.full((feature.size(0),), client_id, dtype=torch.long))
 
-                output = local_classifer(local_feature_extractor(data))
+                output = local_classifer(feature)
                 loss1 = torch.nn.CrossEntropyLoss()(output, target)
                 loss1.backward(retain_graph=True)
                 g_i = [
@@ -152,8 +159,9 @@ class fed_dg:
             train_acc = train_correct / train_samples
             train_loss /= (idx+1)
             sum_loss += train_loss
+            sum_acc += train_acc
             print(
-                f"Client #{client_id} | Epoch: {epoch}/{self.args.n_client_epochs} | Train Loss: {train_loss} | Train Acc: {train_acc}",
+                f"Client #{client_id} | Epoch: {epoch+1}/{self.args.n_client_epochs} | Train Loss: {train_loss} | Train Acc: {train_acc}",
                 end="\r",
             )
             local_feature_extractor.eval()
@@ -166,26 +174,30 @@ class fed_dg:
                     valid_samples += len(data)
                 valid_acc = valid_correct / valid_samples
                 print(
-                    f"Client #{client_id} | Epoch: {epoch}/{self.args.n_client_epochs} | Valid Acc: {valid_acc}",
+                    f"Client #{client_id} | Epoch: {epoch+1}/{self.args.n_client_epochs} | Valid Acc: {valid_acc}",
                     end="\r",
                 )
         scheduler.step()
 
-        return local_feature_extractor, local_classifer, sum_loss/self.args.n_client_epochs
+        return local_feature_extractor, local_classifer, sum_loss/self.args.n_client_epochs, sum_acc/self.args.n_client_epochs, torch.cat(features), torch.cat(labels)
     
     def train_server(self):
         train_losses = []
+        train_acc = []
         for i in range(self.args.n_epochs):
             print(f"round {i+1}/{self.args.n_epochs}")
 
             clients_feature_extractor = []
             clients_classifer = []
+
             clients_losses = []
+            client_accs = []
+
             self.global_feature_extractor.train()
             self.global_classifer.train()
 
             for client_id in range(self.num_clients):
-                client_feature_extractor, client_classifer, client_loss = self.train_clients(self.global_feature_extractor,
+                client_feature_extractor, client_classifer, client_loss ,client_acc= self.train_clients(self.global_feature_extractor,
                                                                                              self.global_classifer,
                                                                                              self.train_loaders[client_id],
                                                                                              self.valid_loaders[client_id],
@@ -193,6 +205,7 @@ class fed_dg:
                 clients_feature_extractor.append(client_feature_extractor.state_dict())
                 clients_classifer.append(client_classifer.state_dict())
                 clients_losses.append(client_loss)
+                client_accs.append(client_acc)
             
             updated_weights_f = utils.static_avg(clients_feature_extractor)
             updated_weights_c = utils.static_avg(clients_classifer)
@@ -203,14 +216,18 @@ class fed_dg:
             avg_loss = sum(clients_losses) / len(clients_losses)
             train_losses.append(avg_loss)
 
-    # def test(self):
-    #     self.global_feature_extractor.eval()
-    #     self.global_classifer.eval()
+            avg_acc = sum(client_accs) / len(client_accs)
+            train_acc.append(avg_acc)
+            print(f"round {i+1}/{self.args.n_epochs} | Average Loss: {avg_loss} | Average Acc: {avg_acc}")
 
-    #     domain_classifier = domain_clf(512,self.num_clients,self.num_classes)
+    def test(self):
+        self.global_feature_extractor.eval()
+        self.global_classifer.eval()
 
-    #     test_correct = 0
-    #     test_samples = 0
+        domain_classifier = domain_clf(512,self.num_clients,self.num_classes)
+
+        test_correct = 0
+        test_samples = 0
         
     
 if __name__ == "__main__":
