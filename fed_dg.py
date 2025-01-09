@@ -70,7 +70,7 @@ class fed_dg:
             train_dataloaders.append(train_dataloader)
             valid_dataloaders.append(valid_dataloader)
 
-        test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+        test_dataloader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
         return  train_dataloaders, valid_dataloaders, test_dataloader
     
 
@@ -214,6 +214,7 @@ class fed_dg:
             client_features = []
             client_labels = []
 
+            client_samples = []
             total_sample = 0
             self.global_feature_extractor.train()
             self.global_classifer.train()
@@ -231,13 +232,16 @@ class fed_dg:
                 client_valid_accs.append(client_valid_acc)
                 client_features.append(client_feature)
                 client_labels.append(client_label)
+                
+                client_samples.append(client_sample)
+
                 total_sample += client_sample
             
             client_features = torch.cat(client_features)
             client_labels = torch.cat(client_labels)
 
-            updated_weights_f = utils.static_avg(self.clients_feature_extractor)
-            updated_weights_c = utils.static_avg(self.clients_classifer)
+            updated_weights_f = utils.static_avg(self.clients_feature_extractor,client_samples)
+            updated_weights_c = utils.static_avg(self.clients_classifer,client_samples)
 
             self.global_feature_extractor.load_state_dict(updated_weights_f)
             self.global_classifer.load_state_dict(updated_weights_c)
@@ -285,14 +289,16 @@ class fed_dg:
 
             data, target = data.to(self.device), target.to(self.device)
 
-            output = self.domain_classifier(self.global_feature_extractor(data).unsqueeze(-1).unsqueeze(-1))
-            output = output.squeeze(0)
-            new_updated_weights_f = utils.dynamic_avg(self.clients_feature_extractor,output)
-            new_updated_weights_c = utils.dynamic_avg(self.clients_classifer,output)
-            self.new_global_feature_extractor.load_state_dict(new_updated_weights_f)
-            self.new_global_classifer.load_state_dict(new_updated_weights_c)
+            # output = self.domain_classifier(self.global_feature_extractor(data).unsqueeze(-1).unsqueeze(-1))
+            # output = output.squeeze(0)
+
+            # new_updated_weights_f = utils.dynamic_avg(self.clients_feature_extractor,output)
+            # new_updated_weights_c = utils.dynamic_avg(self.clients_classifer,output)
+            # self.new_global_feature_extractor.load_state_dict(new_updated_weights_f)
+            # self.new_global_classifer.load_state_dict(new_updated_weights_c)
             
-            output = self.new_global_classifer(self.new_global_feature_extractor(data))
+            # output = self.new_global_classifer(self.new_global_feature_extractor(data))
+            output = self.global_classifer(self.global_feature_extractor(data))
             test_correct += (output.argmax(1) == target).sum().item()
             test_sample += len(data)
 

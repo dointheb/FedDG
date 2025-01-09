@@ -4,13 +4,15 @@ from typing import  Dict, List
 import argparse
 import collections
 
-def static_avg(weights:List[Dict[str,torch.Tensor]]) -> Dict[str,torch.Tensor]:
+def static_avg(weights:List[Dict[str,torch.Tensor]],client_samples) -> Dict[str,torch.Tensor]:
 
-    weights_avg = copy.deepcopy(weights[0])
-    for key in weights_avg.keys():
-        for i in range(1, len(weights)):
-            weights_avg[key] += weights[i][key]
-        weights_avg[key] = torch.div(weights_avg[key], len(weights))
+    total_samples = sum(client_samples)
+    weights_avg = {key: torch.zeros_like(weights[0][key]) for key in weights[0].keys()}
+
+    for i, model_weights in enumerate(weights):
+        for key in weights_avg.keys():
+            weights_avg[key] = weights_avg[key].to(torch.float32)
+            weights_avg[key] += model_weights[key] * (client_samples[i] / total_samples)
     
     return weights_avg
 
@@ -74,7 +76,7 @@ def arg_parser():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--test_domain", type=str, default='Photo')
 
-    parser.add_argument("--n_epochs", type=int, default=30)
+    parser.add_argument("--n_epochs", type=int, default=40)
     parser.add_argument("--n_client_epochs", type=int, default=1)
 
     return parser.parse_args()
