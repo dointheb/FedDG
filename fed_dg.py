@@ -4,11 +4,12 @@ import copy
 from torch import nn
 from domain_clf import domain_clf
 import torchvision.models as models
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Subset,TensorDataset
 from torchvision import datasets, transforms
 from torchvision.transforms import RandAugment
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.nn.functional as F
+from tqdm import tqdm
 
 class fed_dg:
     def __init__(self,args):
@@ -27,7 +28,17 @@ class fed_dg:
             nn.Linear(128, self.num_classes)
         ).to(self.device)
 
-        
+        self.clients_feature_extractor = []
+        self.clients_classifer = []
+
+        self.domain_classifier = domain_clf(512,self.num_clients,int(10)).to(self.device)
+        self.new_global_feature_extractor = models.resnet18(pretrained=True).to(self.device)
+        self.new_global_feature_extractor.fc = nn.Linear(512, 512).to(self.device)
+        self.new_global_classifer = nn.Sequential(
+            nn.Linear(512,128),
+            nn.ReLU(),
+            nn.Linear(128, self.num_classes)
+        ).to(self.device)
 
     def load_domain_data(self,root,domain):
         domain_path = f"{root}/{domain}"
@@ -59,7 +70,7 @@ class fed_dg:
             train_dataloaders.append(train_dataloader)
             valid_dataloaders.append(valid_dataloader)
 
-        test_dataloader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False)
+        test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False)
         return  train_dataloaders, valid_dataloaders, test_dataloader
     
 
@@ -84,14 +95,18 @@ class fed_dg:
         rand_augment = RandAugment(num_ops=2, magnitude=9)
         sum_loss = 0
         sum_acc = 0
+        sum_valid_acc = 0
         features = []
         labels = []
+        total_sample = 0
         for epoch in range(self.args.n_client_epochs):
             train_loss = 0
             train_correct = 0
             train_samples = 0
             valid_correct = 0
             valid_samples = 0
+            total_sample = 0
+
             idx = 0
             local_feature_extractor.train()
             local_classifer.train()
@@ -101,7 +116,7 @@ class fed_dg:
 
                 optimizer.zero_grad()
                 feature = local_feature_extractor(data)
-                features.append(feature)
+                features.append(feature.detach())
                 labels.append(torch.full((feature.size(0),), client_id, dtype=torch.long))
 
                 output = local_classifer(feature)
@@ -156,6 +171,7 @@ class fed_dg:
                 train_correct += (output.argmax(1) == target).sum().item() + (output_aug.argmax(1) == target).sum().item()
                 train_samples += len(data) * 2
 
+            total_sample += train_samples / 2
             train_acc = train_correct / train_samples
             train_loss /= (idx+1)
             sum_loss += train_loss
@@ -173,13 +189,14 @@ class fed_dg:
                     valid_correct += (output.argmax(1) == target).sum().item()
                     valid_samples += len(data)
                 valid_acc = valid_correct / valid_samples
+                sum_valid_acc += valid_acc
                 print(
                     f"Client #{client_id} | Epoch: {epoch+1}/{self.args.n_client_epochs} | Valid Acc: {valid_acc}",
                     end="\r",
                 )
         scheduler.step()
 
-        return local_feature_extractor, local_classifer, sum_loss/self.args.n_client_epochs, sum_acc/self.args.n_client_epochs, torch.cat(features), torch.cat(labels)
+        return local_feature_extractor, local_classifer, sum_loss/self.args.n_client_epochs, sum_acc/self.args.n_client_epochs, sum_valid_acc/self.args.n_client_epochs, torch.cat(features), torch.cat(labels), total_sample
     
     def train_server(self):
         train_losses = []
@@ -187,28 +204,40 @@ class fed_dg:
         for i in range(self.args.n_epochs):
             print(f"round {i+1}/{self.args.n_epochs}")
 
-            clients_feature_extractor = []
-            clients_classifer = []
+            self.clients_feature_extractor = []
+            self.clients_classifer = []
 
             clients_losses = []
             client_accs = []
+            client_valid_accs = []
 
+            client_features = []
+            client_labels = []
+
+            total_sample = 0
             self.global_feature_extractor.train()
             self.global_classifer.train()
 
             for client_id in range(self.num_clients):
-                client_feature_extractor, client_classifer, client_loss ,client_acc= self.train_clients(self.global_feature_extractor,
+                client_feature_extractor, client_classifer, client_loss ,client_acc, client_valid_acc,client_feature, client_label, client_sample= self.train_clients(self.global_feature_extractor,
                                                                                              self.global_classifer,
                                                                                              self.train_loaders[client_id],
                                                                                              self.valid_loaders[client_id],
                                                                                              client_id)
-                clients_feature_extractor.append(client_feature_extractor.state_dict())
-                clients_classifer.append(client_classifer.state_dict())
+                self.clients_feature_extractor.append(client_feature_extractor.state_dict())
+                self.clients_classifer.append(client_classifer.state_dict())
                 clients_losses.append(client_loss)
                 client_accs.append(client_acc)
+                client_valid_accs.append(client_valid_acc)
+                client_features.append(client_feature)
+                client_labels.append(client_label)
+                total_sample += client_sample
             
-            updated_weights_f = utils.static_avg(clients_feature_extractor)
-            updated_weights_c = utils.static_avg(clients_classifer)
+            client_features = torch.cat(client_features)
+            client_labels = torch.cat(client_labels)
+
+            updated_weights_f = utils.static_avg(self.clients_feature_extractor)
+            updated_weights_c = utils.static_avg(self.clients_classifer)
 
             self.global_feature_extractor.load_state_dict(updated_weights_f)
             self.global_classifer.load_state_dict(updated_weights_c)
@@ -217,23 +246,66 @@ class fed_dg:
             train_losses.append(avg_loss)
 
             avg_acc = sum(client_accs) / len(client_accs)
+            avg_valid_acc = sum(client_valid_accs) / len(client_valid_accs)
             train_acc.append(avg_acc)
-            print(f"round {i+1}/{self.args.n_epochs} | Average Loss: {avg_loss} | Average Acc: {avg_acc}")
+            print(f"round {i+1}/{self.args.n_epochs} | Average Loss: {avg_loss} | Average train Acc: {avg_acc} | Average valid Acc: {avg_valid_acc}")
+
+            fe_dataset = TensorDataset(client_features,client_labels)
+            fe_dataloader = DataLoader(fe_dataset, batch_size=self.batch_size, shuffle=True)
+            if i == 0:
+                self.domain_classifier = domain_clf(512,self.num_clients,int(total_sample)).to(self.device)
+            optimizer = torch.optim.SGD(self.domain_classifier.parameters(), lr=self.lr, momentum=0.9, weight_decay=5e-4)
+
+            fe_loss = 0
+            fe_correct = 0
+            idx = 0
+            for idx,(data,target) in enumerate(fe_dataloader):
+                data, target = data.to(self.device), target.to(self.device)
+                data = data.unsqueeze(-1).unsqueeze(-1)
+                optimizer.zero_grad()
+                output = self.domain_classifier(data)
+                loss = torch.nn.CrossEntropyLoss()(output, target)
+                loss.backward()
+                optimizer.step()
+                fe_loss += loss.item()
+                fe_correct += (output.argmax(1) == target).sum().item()
+            
+            print(f"round {i+1}/{self.args.n_epochs} | Classifier Loss: {fe_loss / (idx+1)} | Classifier Acc: {fe_correct/total_sample}")
+
+            
+
 
     def test(self):
         self.global_feature_extractor.eval()
         self.global_classifer.eval()
-
-        domain_classifier = domain_clf(512,self.num_clients,self.num_classes)
-
         test_correct = 0
-        test_samples = 0
+        test_sample = 0
+        pbar = tqdm(self.test_loader, ncols=110)
+        for idx, (data, target) in enumerate(pbar):
+
+            data, target = data.to(self.device), target.to(self.device)
+
+            output = self.domain_classifier(self.global_feature_extractor(data).unsqueeze(-1).unsqueeze(-1))
+            output = output.squeeze(0)
+            new_updated_weights_f = utils.dynamic_avg(self.clients_feature_extractor,output)
+            new_updated_weights_c = utils.dynamic_avg(self.clients_classifer,output)
+            self.new_global_feature_extractor.load_state_dict(new_updated_weights_f)
+            self.new_global_classifer.load_state_dict(new_updated_weights_c)
+            
+            output = self.new_global_classifer(self.new_global_feature_extractor(data))
+            test_correct += (output.argmax(1) == target).sum().item()
+            test_sample += len(data)
+
+        test_acc = test_correct / test_sample
+        print(f"Test Accuracy: {test_acc}") 
+
         
     
 if __name__ == "__main__":
     args = utils.arg_parser()
     fed = fed_dg(args)
     fed.train_server()
+    fed.test()
     # fed_dg.test()
         
         

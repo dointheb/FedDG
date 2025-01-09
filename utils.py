@@ -2,6 +2,7 @@ import copy
 import torch
 from typing import  Dict, List
 import argparse
+import collections
 
 def static_avg(weights:List[Dict[str,torch.Tensor]]) -> Dict[str,torch.Tensor]:
 
@@ -18,6 +19,7 @@ def dynamic_avg(weights:List[Dict[str,torch.Tensor]],cls_res:torch.Tensor) -> Di
     weights_avg = {key: torch.zeros_like(weights[0][key]) for key in weights[0].keys()}
     for i, model_weights in enumerate(weights):
         for key in weights_avg.keys():
+            weights_avg[key] = weights_avg[key].to(torch.float32)
             weights_avg[key] += model_weights[key] * cls_weights[i]
 
     return weights_avg
