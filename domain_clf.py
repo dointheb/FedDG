@@ -6,7 +6,7 @@ class domain_clf(nn.Module):
     def __init__(self,input_dim,num_clients,num_image,ratio=16):
         super(domain_clf,self).__init__()
         self.model = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
+            # nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(input_dim,num_image//num_clients,1),
             nn.Flatten(),
             nn.Linear(num_image//num_clients, num_image//num_clients//ratio),

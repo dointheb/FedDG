@@ -1,9 +1,8 @@
-import copy
 import torch
 from typing import  Dict, List
 import argparse
-import collections
 
+#根据客户端的样本数对模型参数进行加权平均
 def static_avg(weights:List[Dict[str,torch.Tensor]],client_samples) -> Dict[str,torch.Tensor]:
 
     total_samples = sum(client_samples)
@@ -16,6 +15,7 @@ def static_avg(weights:List[Dict[str,torch.Tensor]],client_samples) -> Dict[str,
     
     return weights_avg
 
+#根据客户端的分类结果对模型参数进行加权平均
 def dynamic_avg(weights:List[Dict[str,torch.Tensor]],cls_res:torch.Tensor) -> Dict[str,torch.Tensor]:
     cls_weights = cls_res.view(-1)
     weights_avg = {key: torch.zeros_like(weights[0][key]) for key in weights[0].keys()}
@@ -26,6 +26,7 @@ def dynamic_avg(weights:List[Dict[str,torch.Tensor]],cls_res:torch.Tensor) -> Di
 
     return weights_avg
 
+#根据命令行的参数设置数据集的路径和超参数
 def get_params(args):
     path, num_clients, train_split, domains, num_classes, batch_size, lr, hyper= None, 3, None, None, 1, None, 0.001, 0.3
     if args.dataset == 'PACS':
@@ -70,11 +71,12 @@ def get_params(args):
     
     return path, num_clients, train_split, domains, num_classes, batch_size, lr, hyper
 
+#设置命令行参数
 def arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default='PACS', help='dataset name')
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--test_domain", type=str, default='Photo')
+    parser.add_argument("--test_domain", type=str, default='photo')
 
     parser.add_argument("--n_epochs", type=int, default=40)
     parser.add_argument("--n_client_epochs", type=int, default=1)
