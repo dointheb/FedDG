@@ -5,14 +5,18 @@ import argparse
 #根据客户端的样本数对模型参数进行加权平均
 def static_avg(weights:List[Dict[str,torch.Tensor]],client_samples) -> Dict[str,torch.Tensor]:
 
-    total_samples = sum(client_samples)
+    # total_samples = sum(client_samples)
     weights_avg = {key: torch.zeros_like(weights[0][key]) for key in weights[0].keys()}
 
-    for i, model_weights in enumerate(weights):
-        for key in weights_avg.keys():
-            weights_avg[key] = weights_avg[key].to(torch.float32)
-            weights_avg[key] += model_weights[key] * (client_samples[i] / total_samples)
-    
+    # for i, model_weights in enumerate(weights):
+    #     for key in weights_avg.keys():
+            # weights_avg[key] = weights_avg[key].to(torch.float32)
+            # weights_avg[key] += model_weights[key] * (client_samples[i] / total_samples) 
+    for key in weights_avg.keys():
+        for i, model_weights in enumerate(weights):
+            weights_avg[key] += model_weights[key]
+        weights_avg[key] = weights_avg[key].to(torch.float32)
+        weights_avg[key] /= len(weights)
     return weights_avg
 
 #根据客户端的分类结果对模型参数进行加权平均

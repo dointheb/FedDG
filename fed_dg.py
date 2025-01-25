@@ -23,15 +23,18 @@ class fed_dg:
         self.train_loaders, self.valid_loaders, self.test_loader = self.get_data(self.root,self.domains,self.test_domain,self.train_split)
         
         #定义全局特征提取器和全局分类器
-        #全局特征提取器为resnet18的预训练模型，全局分类器为两层全连接层
-        #全局特征提取器最后一层的全连接层的输出维度被修改为与输入维度相同
-        self.global_feature_extractor = models.resnet18(pretrained=True).to(self.device)
-        self.global_feature_extractor.fc = nn.Linear(512, 512).to(self.device)
-        self.global_classifer = nn.Sequential(
-            nn.Linear(512,128),
-            nn.ReLU(),
-            nn.Linear(128, self.num_classes)
-        ).to(self.device)
+        #全局特征提取器为resnet18的预训练模型
+        model = models.resnet18(pretrained=True).to(self.device)
+        model.fc = nn.Linear(in_features=model.fc.in_features, out_features=self.num_classes)
+        
+        self.global_feature_extractor = nn.Sequential(*list(model.children())[:-1]).to(self.device)
+        self.global_classifer = model.fc.to(self.device)
+        # self.global_feature_extractor.fc = nn.Linear(512, 512).to(self.device)
+        # self.global_classifer = nn.Sequential(
+        #     nn.Linear(512,128),
+        #     nn.ReLU(),
+        #     nn.Linear(128, self.num_classes)
+        # ).to(self.device)
 
         #定义客户端特征提取器和客户端分类器列表
         self.clients_feature_extractor = []
@@ -149,6 +152,7 @@ class fed_dg:
                 optimizer.zero_grad()
                 
                 feature = local_feature_extractor(data)
+                feature = torch.flatten(feature, start_dim=1)
                 output = local_classifer(feature)
 
                 #获取特征及标签,将其加入到features和labels中
@@ -187,7 +191,9 @@ class fed_dg:
 
                 #计算本地特征提取器加上不同客户端分类器对原始数据的交叉熵损失 并计算该损失对特征提取器的梯度g_i
                 for client_head in clients_heads:
-                    output_global = client_head(local_feature_extractor(data))
+                    feature = local_feature_extractor(data)
+                    feature = torch.flatten(feature, start_dim=1)
+                    output_global = client_head(feature)
                     loss_global = torch.nn.CrossEntropyLoss()(output_global, target)
                     loss_global.backward(retain_graph=True)
                     g_global = [
@@ -200,7 +206,9 @@ class fed_dg:
                     client_head.zero_grad()
 
                 #计算本地模型对增强数据的交叉熵损失 并计算该损失对特征提取器的梯度g_i_prime
-                output_aug = local_classifer(local_feature_extractor(aug_data))
+                feature = local_feature_extractor(aug_data)
+                feature = torch.flatten(feature, start_dim=1)
+                output_aug = local_classifer(feature)
                 loss2 = torch.nn.CrossEntropyLoss()(output_aug, target)
                 loss2.backward(retain_graph=True)
                 g_i_prime = [
@@ -248,7 +256,9 @@ class fed_dg:
             with torch.no_grad():
                 for idx,(data,target) in enumerate(valid_loader):
                     data, target = data.to(self.device), target.to(self.device)
-                    output = local_classifer(local_feature_extractor(data))
+                    feature = local_feature_extractor(data)
+                    feature = torch.flatten(feature, start_dim=1)
+                    output = local_classifer(feature)
                     valid_correct += (output.argmax(1) == target).sum().item()
                     valid_samples += len(data)
                 valid_acc = valid_correct / valid_samples
@@ -382,13 +392,18 @@ class fed_dg:
     def test(self):
 
         #定义新的全局特征提取器和全局分类器(动态聚合)
-        new_global_feature_extractor = models.resnet18(pretrained=True).to(self.device)
-        new_global_feature_extractor.fc = nn.Linear(512, 512).to(self.device)
-        new_global_classifer = nn.Sequential(
-            nn.Linear(512,128),
-            nn.ReLU(),
-            nn.Linear(128, self.num_classes)
-        ).to(self.device)
+        model = models.resnet18(pretrained=True).to(self.device)
+        model.fc = nn.Linear(in_features=model.fc.in_features, out_features=self.num_classes)
+        
+        new_global_feature_extractor = nn.Sequential(*list(model.children())[:-1]).to(self.device)
+        new_global_classifer = model.fc.to(self.device)
+        # new_global_feature_extractor = models.resnet18(pretrained=True).to(self.device)
+        # new_global_feature_extractor.fc = nn.Linear(512, 512).to(self.device)
+        # new_global_classifer = nn.Sequential(
+        #     nn.Linear(512,128),
+        #     nn.ReLU(),
+        #     nn.Linear(128, self.num_classes)
+        # ).to(self.device)
 
         self.global_feature_extractor.eval()
         self.global_classifer.eval()
@@ -400,7 +415,9 @@ class fed_dg:
             
             #将测试数据输入到全局特征提取器,获得特征后加入域分类器进行类别预测,得到域概率分布output
             data, target = data.to(self.device), target.to(self.device)
-            output = self.domain_classifier(self.global_feature_extractor(data).unsqueeze(-1).unsqueeze(-1))
+            feature = self.global_feature_extractor(data)
+            feature = torch.flatten(feature, start_dim=1)
+            output = self.domain_classifier(feature.unsqueeze(-1).unsqueeze(-1))
             output = output.squeeze(0)
 
             #使用域概率分布output作为权重参数 动态聚合客户端特征提取器和分类器,获得新的全局特征提取器和全局分类器
@@ -410,9 +427,14 @@ class fed_dg:
             new_global_classifer.load_state_dict(new_updated_weights_c)
             
             #将新的全局特征提取器和全局分类器用于测试
-            output = new_global_classifer(new_global_feature_extractor(data))
+            feature = new_global_feature_extractor(data)
+            feature = torch.flatten(feature, start_dim=1)
+            output = new_global_classifer(feature)
 
-            # output = self.global_classifer(self.global_feature_extractor(data))
+            # 不采用test-time
+            # feature = self.global_feature_extractor(data)
+            # feature = torch.flatten(feature, start_dim=1)
+            # output = self.global_classifer(feature)
 
             test_correct += (output.argmax(1) == target).sum().item()
             test_sample += len(data)
