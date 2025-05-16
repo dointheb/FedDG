@@ -1,6 +1,7 @@
 import torch
 import utils
 import copy
+import pacs
 from torch import nn
 from domain_clf import domain_clf
 import torchvision.models as models
@@ -10,6 +11,7 @@ from torchvision.transforms import RandAugment
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torch.nn.functional as F
 from tqdm import tqdm
+import torch.nn.init as init
 
 class fed_dg:
     def __init__(self,args):
@@ -21,20 +23,15 @@ class fed_dg:
         self.root , self.num_clients, self.train_split, self.domains, self.num_classes, self.batch_size, self.lr, self.hyper = utils.get_params(args)
         #根据数据集路径和域名称返回相应的dataloader
         self.train_loaders, self.valid_loaders, self.test_loader = self.get_data(self.root,self.domains,self.test_domain,self.train_split)
-        
+        self.scheduler_state = None
         #定义全局特征提取器和全局分类器
         #全局特征提取器为resnet18的预训练模型
         model = models.resnet18(pretrained=True).to(self.device)
-        model.fc = nn.Linear(in_features=model.fc.in_features, out_features=self.num_classes)
-        
         self.global_feature_extractor = nn.Sequential(*list(model.children())[:-1]).to(self.device)
-        self.global_classifer = model.fc.to(self.device)
-        # self.global_feature_extractor.fc = nn.Linear(512, 512).to(self.device)
-        # self.global_classifer = nn.Sequential(
-        #     nn.Linear(512,128),
-        #     nn.ReLU(),
-        #     nn.Linear(128, self.num_classes)
-        # ).to(self.device)
+        self.global_classifier = nn.Linear(in_features=model.fc.in_features, out_features=self.num_classes).to(self.device)
+        init.xavier_uniform_(self.global_classifier.weight)
+        init.zeros_(self.global_classifier.bias)
+        
 
         #定义客户端特征提取器和客户端分类器列表
         self.clients_feature_extractor = []
@@ -42,13 +39,13 @@ class fed_dg:
 
         #在__init__中定义调度器,方便按round进行调度
         #由于调度器初始化需要用到优化器，而优化器不能初始化为None，所以在这里随便初始化了一下优化器,后续会重新初始化
-        self.scheduler_state = None
-        optimizer = torch.optim.SGD([{'params':self.global_feature_extractor.parameters(),'lr':self.lr},
-                                            {'params':self.global_classifer.parameters(),'lr':self.lr}], momentum=0.9, weight_decay=5e-4)
-        self.scheduler = CosineAnnealingLR(optimizer, T_max=self.args.n_epochs, eta_min=0.0001)
+        # self.scheduler_state = None
+        # optimizer = torch.optim.SGD([{'params':self.global_feature_extractor.parameters(),'lr':self.lr},
+        #                                     {'params':self.global_classifier.parameters(),'lr':self.lr}], momentum=0.9, weight_decay=5e-4)
+        # self.scheduler = CosineAnnealingLR(optimizer, T_max=self.args.n_epochs, eta_min=0.0001)
         
         #在__init__中定义域分类器,方便在train中训练,在test中使用,不能初始化为None,否则test里调用会报错,所以随便初始化了一下,之后会重新初始化
-        self.domain_classifier = domain_clf(512,self.num_clients,int(10)).to(self.device)
+        # self.domain_classifier = domain_clf(512,self.num_clients,int(10)).to(self.device)
 
        
     #根据域路径加载数据集,其中transform为resnet18的预训练模型的预处理
@@ -64,6 +61,10 @@ class fed_dg:
     
     #根据数据集路径和域名称返回相应的dataloader
     def get_data(self,root,domains,test_domain,train_split):
+        if(self.args.dataset == 'PACS'):
+            train_loaders, valid_loaders, test_loader = pacs.get_pacs_data(test_domain)
+            return train_loaders, valid_loaders, test_loader
+        
         train_domains = [domain for domain in domains if domain != test_domain]
         test_dataset = self.load_domain_data(root,test_domain)
         train_datasets = [self.load_domain_data(root,train_domain) for train_domain in train_domains]
@@ -94,29 +95,34 @@ class fed_dg:
         for img in images:
             pil_img = transforms.ToPILImage()(img)
             augmented_img = rand_augment(pil_img)
-            augmented_img = transforms.ToTensor()(augmented_img)
             augmented_images.append(augmented_img)
         return torch.stack(augmented_images)
 
     #单个客户端的训练
     #传入参数:全局特征提取器,全局分类器,所有客户端的特征提取器,所有客户端的分类器,该客户端所有的训练集dataloader,该客户端所有的验证集dataloader,客户端id
-    def train_clients(self,global_feature_extractor,global_classifer,clients_heads,train_loader,valid_loader,client_id):
+    def train_clients(self,clients_heads,train_loader,valid_loader,client_id):
         
         #复制全局特征提取器和全局分类器
-        local_feature_extractor = copy.deepcopy(global_feature_extractor)
-        local_classifer = copy.deepcopy(global_classifer)
+        local_feature_extractor = copy.deepcopy(self.global_feature_extractor)
+        local_classifier = copy.deepcopy(self.global_classifier)
         
         #重新初始化优化器和调度器
         optimizer = torch.optim.SGD([{'params':local_feature_extractor.parameters(),'lr':self.lr},
-                                            {'params':local_classifer.parameters(),'lr':self.lr}], momentum=0.9, weight_decay=5e-4)
+                                            {'params':local_classifier.parameters(),'lr':self.lr}], momentum=0.9, weight_decay=5e-4)
         
         self.scheduler = CosineAnnealingLR(optimizer, T_max=self.args.n_epochs, eta_min=0.0001)
+
         #为了能够按照round进行调度,因此需要在每个round开始时加载调度器的状态
         if self.scheduler_state is not None:
             self.scheduler.load_state_dict(self.scheduler_state)
         
         #定义randaugment增强
-        rand_augment = RandAugment(num_ops=2, magnitude=9)
+        rand_aug_pipeline = transforms.Compose([
+            RandAugment(num_ops=2, magnitude=9),
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406],  [0.229, 0.224, 0.225])
+        ])
 
         #定义每个round客户端的损失和准确率
         sum_loss = 0
@@ -130,6 +136,8 @@ class fed_dg:
         #定义每个round客户端的样本数,以便服务器端域分类器的训练(域分类器需要所有客户端的总样本数)
         total_sample = 0
 
+        local_feature_extractor.train()
+        local_classifier.train()
         for epoch in range(self.args.n_client_epochs):
             
             #定义每个epoch的训练和验证的损失和准确率 及相应的样本数
@@ -141,37 +149,33 @@ class fed_dg:
             total_sample = 0
 
             idx = 0
-            local_feature_extractor.train()
-            local_classifer.train()
-
             #开始训练
             for idx,(data,target) in enumerate(train_loader):
                 data, target = data.to(self.device), target.to(self.device)
-                aug_data = self.apply_randaugment(data,rand_augment).to(self.device)
+                aug_data = self.apply_randaugment(data,rand_aug_pipeline ).to(self.device)
             
                 optimizer.zero_grad()
                 
-                feature = local_feature_extractor(data)
-                feature = torch.flatten(feature, start_dim=1)
-                output = local_classifer(feature)
+                feature_orig = local_feature_extractor(data).flatten(1)
+                output = local_classifier(feature_orig)
+                feature_aug = local_feature_extractor(aug_data).flatten(1)
+                output_aug = local_classifier(feature_aug)
 
                 #获取特征及标签,将其加入到features和labels中
-                features.append(feature.detach())
-                labels.append(torch.full((feature.size(0),), client_id, dtype=torch.long))
+                features.append(feature_orig.detach())
+                labels.append(torch.full((feature_orig.size(0),), client_id, dtype=torch.long))
 
                 #计算本地模型对原始数据的交叉熵损失 并计算该损失对特征提取器的梯度g_i
                 loss1 = torch.nn.CrossEntropyLoss()(output, target)
-                loss1.backward(retain_graph=True)
-                g_i = [
-                    param.grad.view(-1)
-                        for param in local_classifer.parameters() if param.grad is not None
-                ]
-                g_i = torch.cat(g_i)
+                g_i = torch.autograd.grad(loss1,local_classifier.parameters(), retain_graph=True)
+                g_i = torch.cat([g.view(-1) for g in g_i])
+                
+                loss2 = torch.nn.CrossEntropyLoss()(output_aug, target)
+                g_i_prime = torch.autograd.grad(loss2,local_classifier.parameters(), retain_graph=True)
+                g_i_prime = torch.cat([g.view(-1) for g in g_i_prime])
 
-                #梯度清零 以便后续计算
-                local_feature_extractor.zero_grad()
-                local_classifer.zero_grad()
 
+                L_intra = 1 - F.cosine_similarity(g_i.unsqueeze(0), g_i_prime.unsqueeze(0)).mean()
                 #以下注释掉的代码是利用全局分类器来计算全局梯度,但是先按照论文里的来,也就是利用每个客户端的分类器的梯度
                 # output_global = global_classifer(local_feature_extractor(data))
                 # loss_global = torch.nn.CrossEntropyLoss()(output_global, target)
@@ -185,51 +189,19 @@ class fed_dg:
                 # local_feature_extractor.zero_grad()
                 # global_classifer.zero_grad()
 
-
                 #定义交叉熵损失对所有客户端分类器的梯度
-                g_globals = []
-
+                
+                L_inter = 0
                 #计算本地特征提取器加上不同客户端分类器对原始数据的交叉熵损失 并计算该损失对特征提取器的梯度g_i
                 for client_head in clients_heads:
-                    feature = local_feature_extractor(data)
-                    feature = torch.flatten(feature, start_dim=1)
-                    output_global = client_head(feature)
+                    output_global = client_head(feature_orig)
                     loss_global = torch.nn.CrossEntropyLoss()(output_global, target)
-                    loss_global.backward(retain_graph=True)
-                    g_global = [
-                        param.grad.view(-1)
-                            for param in client_head.parameters() if param.grad is not None
-                        ]
-                    g_global = torch.cat(g_global)
-                    g_globals.append(g_global)
-                    local_feature_extractor.zero_grad()
-                    client_head.zero_grad()
+                    g_global = torch.autograd.grad(loss_global,client_head.parameters(), retain_graph=True)
+                    g_global = torch.cat([g.view(-1) for g in g_global])
+                    L_inter += 1 - F.cosine_similarity(g_global.unsqueeze(0), g_i_prime.unsqueeze(0)).mean()
+                L_inter /= len(clients_heads)
 
-                #计算本地模型对增强数据的交叉熵损失 并计算该损失对特征提取器的梯度g_i_prime
-                feature = local_feature_extractor(aug_data)
-                feature = torch.flatten(feature, start_dim=1)
-                output_aug = local_classifer(feature)
-                loss2 = torch.nn.CrossEntropyLoss()(output_aug, target)
-                loss2.backward(retain_graph=True)
-                g_i_prime = [
-                    param.grad.view(-1)
-                    for param in local_classifer.parameters() if param.grad is not None
-                ]
-                g_i_prime = torch.cat(g_i_prime)
-                local_feature_extractor.zero_grad()
-                local_classifer.zero_grad()
-
-                #计算域内相似度(原始数据和增强数据的交叉熵损失对本地分类器的梯度)
-                cosine_similarity_intra = F.cosine_similarity(g_i.unsqueeze(0), g_i_prime.unsqueeze(0))
-
-                L_intra = 1 - cosine_similarity_intra.mean()
-                
-                #计算域间相似度(原始数据的交叉熵损失对不同客户端分类器的梯度与增强数据的交叉熵损失对本地分类器的梯度)
-                L_inter = 0
-                for g_global in g_globals:
-                    cosine_similarity_inter = F.cosine_similarity(g_global.unsqueeze(0), g_i_prime.unsqueeze(0))
-                    L_inter += (1 - cosine_similarity_inter.mean())
-
+            
                 #总的损失函数
                 total_loss = 0.5 * (loss1 + loss2) + self.hyper * L_intra + (1-self.hyper) * L_inter
                 total_loss.backward()
@@ -252,13 +224,12 @@ class fed_dg:
 
             #验证 直接用验证集在本地模型上进行验证
             local_feature_extractor.eval()
-            local_classifer.eval()
+            local_classifier.eval()
             with torch.no_grad():
                 for idx,(data,target) in enumerate(valid_loader):
                     data, target = data.to(self.device), target.to(self.device)
-                    feature = local_feature_extractor(data)
-                    feature = torch.flatten(feature, start_dim=1)
-                    output = local_classifer(feature)
+                    feature = local_feature_extractor(data).flatten(1)
+                    output = local_classifier(feature)
                     valid_correct += (output.argmax(1) == target).sum().item()
                     valid_samples += len(data)
                 valid_acc = valid_correct / valid_samples
@@ -270,15 +241,17 @@ class fed_dg:
 
         #每个round结束后进行调度器的更新
         self.scheduler.step()
-
+        #更新此轮调度器的状态 以便下一轮客户端训练时能够按照round进行调度
+        self.scheduler_state = self.scheduler.state_dict()
         #返回本地特征提取器、本地分类器、平均损失、平均训练准确率、平均验证准确率、所有特征、对应标签、客户端总样本数
-        return local_feature_extractor, local_classifer, sum_loss/self.args.n_client_epochs, sum_acc/self.args.n_client_epochs, sum_valid_acc/self.args.n_client_epochs, torch.cat(features), torch.cat(labels), total_sample
+        return local_feature_extractor, local_classifier, sum_loss/self.args.n_client_epochs, sum_acc/self.args.n_client_epochs, sum_valid_acc/self.args.n_client_epochs,  \
+                torch.cat(features), torch.cat(labels), total_sample
     
     #训练服务器
     def train_server(self):
         
         #初始化各个客户端分类器为全局分类器,以便首次客户端训练
-        clients_heads = [copy.deepcopy(self.global_classifer) for _ in range(self.num_clients)]
+        clients_heads = [copy.deepcopy(self.global_classifier) for _ in range(self.num_clients)]
 
         #开始训练,一共n_epochs个round
         for i in range(self.args.n_epochs):
@@ -305,14 +278,11 @@ class fed_dg:
             #所有客户端的样本数
             total_sample = 0
 
-            self.global_feature_extractor.train()
-            self.global_classifer.train()
 
             #对每个客户端进行训练
             for client_id in range(self.num_clients):
                 #返回客户端特征提取器、客户端分类器、平均损失、平均训练准确率、平均验证准确率、所有特征、对应标签、客户端总样本数
-                client_feature_extractor, client_classifer, client_loss ,client_acc, client_valid_acc, client_feature, client_label, client_sample= self.train_clients(self.global_feature_extractor,
-                                                                                             self.global_classifer,
+                client_feature_extractor, client_classifier, client_loss ,client_acc, client_valid_acc, client_feature, client_label, client_sample= self.train_clients(
                                                                                              clients_heads,
                                                                                              self.train_loaders[client_id],
                                                                                              self.valid_loaders[client_id],
@@ -320,10 +290,10 @@ class fed_dg:
                 
                 #保存客户端特征提取器和分类器
                 self.clients_feature_extractor.append(client_feature_extractor.state_dict())
-                self.clients_classifer.append(client_classifer.state_dict())
+                self.clients_classifer.append(client_classifier.state_dict())
 
                 #保存分类器
-                temp.append(client_classifer)
+                temp.append(client_classifier)
 
                 clients_losses.append(client_loss)
                 client_accs.append(client_acc)
@@ -343,7 +313,7 @@ class fed_dg:
             updated_weights_f = utils.static_avg(self.clients_feature_extractor,client_samples)
             updated_weights_c = utils.static_avg(self.clients_classifer,client_samples)
             self.global_feature_extractor.load_state_dict(updated_weights_f)
-            self.global_classifer.load_state_dict(updated_weights_c)
+            self.global_classifier.load_state_dict(updated_weights_c)
 
             avg_loss = sum(clients_losses) / len(clients_losses)
             avg_acc = sum(client_accs) / len(client_accs)
@@ -377,12 +347,11 @@ class fed_dg:
                 loss.backward()
                 optimizer.step()
                 fe_loss += loss.item()
-                fe_correct += (output.argmax(1) == target).sum().item()
+                fe_correct += (output.argmax(-1) == target).sum().item()
             
             print(f"round {i+1}/{self.args.n_epochs} | Classifier Loss: {fe_loss / (idx+1)} | Classifier Acc: {fe_correct/total_sample}")
 
-            #更新此轮调度器的状态 以便下一轮客户端训练时能够按照round进行调度
-            self.scheduler_state = self.scheduler.state_dict()
+            
             
             
 
@@ -396,17 +365,10 @@ class fed_dg:
         model.fc = nn.Linear(in_features=model.fc.in_features, out_features=self.num_classes)
         
         new_global_feature_extractor = nn.Sequential(*list(model.children())[:-1]).to(self.device)
-        new_global_classifer = model.fc.to(self.device)
-        # new_global_feature_extractor = models.resnet18(pretrained=True).to(self.device)
-        # new_global_feature_extractor.fc = nn.Linear(512, 512).to(self.device)
-        # new_global_classifer = nn.Sequential(
-        #     nn.Linear(512,128),
-        #     nn.ReLU(),
-        #     nn.Linear(128, self.num_classes)
-        # ).to(self.device)
-
+        new_global_classifer = nn.Linear(in_features=model.fc.in_features, out_features=self.num_classes).to(self.device)
+        
         self.global_feature_extractor.eval()
-        self.global_classifer.eval()
+        self.global_classifier.eval()
         test_correct = 0
         test_sample = 0
         pbar = tqdm(self.test_loader, ncols=110)
@@ -415,26 +377,23 @@ class fed_dg:
             
             #将测试数据输入到全局特征提取器,获得特征后加入域分类器进行类别预测,得到域概率分布output
             data, target = data.to(self.device), target.to(self.device)
-            feature = self.global_feature_extractor(data)
-            feature = torch.flatten(feature, start_dim=1)
+            feature = self.global_feature_extractor(data).flatten(1)
             output = self.domain_classifier(feature.unsqueeze(-1).unsqueeze(-1))
             output = output.squeeze(0)
 
-            #使用域概率分布output作为权重参数 动态聚合客户端特征提取器和分类器,获得新的全局特征提取器和全局分类器
+            # 使用域概率分布output作为权重参数 动态聚合客户端特征提取器和分类器,获得新的全局特征提取器和全局分类器
             new_updated_weights_f = utils.dynamic_avg(self.clients_feature_extractor,output)
             new_updated_weights_c = utils.dynamic_avg(self.clients_classifer,output)
             new_global_feature_extractor.load_state_dict(new_updated_weights_f)
             new_global_classifer.load_state_dict(new_updated_weights_c)
             
-            #将新的全局特征提取器和全局分类器用于测试
-            feature = new_global_feature_extractor(data)
-            feature = torch.flatten(feature, start_dim=1)
+            # 将新的全局特征提取器和全局分类器用于测试
+            feature = new_global_feature_extractor(data).flatten(1)
             output = new_global_classifer(feature)
 
             # 不采用test-time
-            # feature = self.global_feature_extractor(data)
-            # feature = torch.flatten(feature, start_dim=1)
-            # output = self.global_classifer(feature)
+            # feature = self.global_feature_extractor(data).flatten(1)
+            # output = self.global_classifier(feature)
 
             test_correct += (output.argmax(1) == target).sum().item()
             test_sample += len(data)
